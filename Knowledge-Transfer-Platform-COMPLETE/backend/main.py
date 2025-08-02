@@ -8,6 +8,12 @@ import hashlib
 import jwt
 from datetime import datetime, timedelta
 import uvicorn
+from fastapi import File, UploadFile, Form
+from typing import List
+from github import Github, InputGitTreeElement
+import os
+import requests
+
 
 app = FastAPI(title="Knowledge Transfer Platform", version="1.0.0")
 
@@ -204,6 +210,43 @@ async def ai_chat(request: dict, user: dict = Depends(verify_token)):
 async def search_knowledge(q: str = "", user: dict = Depends(verify_token)):
     if not q:
         return {"results": [], "total": 0}
+from fastapi.responses import RedirectResponse, JSONResponse
+
+@app.get("/api/v1/github/login")
+def github_login():
+    scope = "repo"  # Change scope as needed
+    github_authorize_url = (
+        f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}"
+        f"&redirect_uri={GITHUB_CALLBACK_URL}&scope={scope}"
+    )
+    return RedirectResponse(github_authorize_url)
+
+
+@app.get("/api/v1/github/callback")
+def github_callback(code: str = None):
+    if not code:
+        return JSONResponse({"error": "No code provided"}, status_code=400)
+
+    token_url = "https://github.com/login/oauth/access_token"
+    data = {
+        "client_id": GITHUB_CLIENT_ID,
+        "client_secret": GITHUB_CLIENT_SECRET,
+        "code": code,
+    }
+    headers = {"Accept": "application/json"}
+
+    resp = requests.post(token_url, data=data, headers=headers)
+    if resp.status_code != 200:
+        return JSONResponse({"error": "Failed to get access token"}, status_code=400)
+    
+    access_token = resp.json().get("access_token")
+    if not access_token:
+        return JSONResponse({"error": "No access token returned"}, status_code=400)
+    
+    # Here, in a real app, you associate the GitHub token with the current user securely.
+    # For demo, return it in the response (not secure for production)
+    return {"access_token": access_token}
+
     
     results = []
     for artifact in DEMO_ARTIFACTS:
@@ -219,6 +262,49 @@ async def search_knowledge(q: str = "", user: dict = Depends(verify_token)):
                 })
     
     return {"results": results, "total": len(results)}
+
+@app.post("/api/v1/github/push")
+async def github_push(
+    github_token: str = Form(...),
+    repo_name: str = Form(...),          # e.g., "username/repo"
+    target_path: str = Form(""),         # e.g., folder path inside repo
+    commit_message: str = Form("Update from Knowledge Transfer Platform"),
+    files: List[UploadFile] = File(...)
+):
+    try:
+        g = Github(github_token)
+        repo = g.get_repo(repo_name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"GitHub repository access error: {str(e)}")
+    
+    try:
+        # Get the reference for the default branch (usually main or master)
+        ref = repo.get_git_ref(f"heads/{repo.default_branch}")
+        latest_commit = repo.get_commit(ref.object.sha)
+        base_tree = repo.get_git_tree(sha=latest_commit.sha)
+
+        elements = []
+        for upload in files:
+            content_bytes = await upload.read()
+            file_path = os.path.join(target_path, upload.filename).replace("\\", "/")  # Normalize path with forward slashes
+            content_str = content_bytes.decode("utf-8")  # Assumes text files; binary handling would differ
+
+            elem = InputGitTreeElement(
+                path=file_path,
+                mode='100644',
+                type='blob',
+                content=content_str
+            )
+            elements.append(elem)
+        
+        new_tree = repo.create_git_tree(elements, base_tree)
+        new_commit = repo.create_git_commit(commit_message, new_tree, [latest_commit.commit])
+        ref.edit(new_commit.sha)
+
+        return {"detail": f"Successfully pushed {len(files)} files to {repo_name}."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GitHub push error: {str(e)}")
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
